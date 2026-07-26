@@ -1,0 +1,261 @@
+// Prisma vs Knex: why Prisma fits this schema better
+//
+// 1. Native UUID support:   @default(uuid())   vs   Knex requires raw SQL or a separate plugin
+// 2. Native ENUM support:   enum + @@map       vs   Knex requires CREATE TYPE in raw migration SQL
+// 3. Partial indexes:       @@index([...], where: "...") — Prisma v4.6+ supports this natively
+//    Knex can do it via raw SQL in migrations, but you lose the declarative diff benefit.
+// 4. JSONB:                 Json type maps to PostgreSQL JSONB automatically
+// 5. Array types:           String[] maps to TEXT[]   vs   Knex needs raw SQL or special handling
+// 6. Declarative migrations: schema → diff → migration file (Prisma) vs imperative (Knex)
+//    For a schema this large (10 tables, 3 enums, 5+ partial indexes), Prisma's diff-based
+//    approach catches subtle errors that raw SQL can miss.
+// 7. Type safety:           Prisma client is fully typed — Zod at the boundary + Prisma for DB
+//    means the compiler catches column name typos. Knex is stringly-typed without extra tooling.
+//
+// The one scenario where Knex wins: when you need complex raw SQL with CTEs, window functions,
+// or multi-table upserts that Prisma's API doesn't express cleanly. For this schema, the
+// queries are straightforward (CRUD + filtered lists + aggregations), so Prisma's type safety
+// saves more than raw SQL flexibility loses.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Enums ────────────────────────────────────────────────────────────────────
+// Mapped to snake_case in PostgreSQL to match the original schema design.
+// Prisma maps these to CREATE TYPE statements in the migration.
+
+enum OrderSide {
+  buy
+  sell
+
+  @@map("order_side")
+}
+
+enum OrderType {
+  market
+  limit
+  stop_loss
+  bracket
+
+  @@map("order_type")
+}
+
+enum OrderStatus {
+  pending
+  open
+  filled
+  partially_filled
+  cancelled
+  expired
+  rejected
+
+  @@map("order_status")
+}
+
+// ── Users ────────────────────────────────────────────────────────────────────
+// UUID PK prevents sequential ID enumeration.
+// Separate from portfolios to reduce lock contention on user row during P&L updates.
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  email        String    @unique
+  passwordHash String    @map("password_hash")
+  name         String
+  twoFactorEnabled Boolean @default(false) @map("two_factor_enabled")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  portfolio    Portfolio?
+  orders       Order[]
+  positions    Position[]
+  watchlists   Watchlist[]
+  priceAlerts  PriceAlert[]
+  tradeEntries TradeJournal[]
+
+  @@map("users")
+}
+
+// ── Portfolios ───────────────────────────────────────────────────────────────
+// 1:1 with User. cooldown_expires_at enables reset-throttling without a separate table.
+
+model Portfolio {
+  id               String           @id @default(uuid()) @db.Uuid
+  userId           String           @unique @map("user_id") @db.Uuid
+  cooldownExpiresAt DateTime?       @map("cooldown_expires_at") @db.Timestamptz
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz
+
+  user             User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balances         PortfolioBalance[]
+
+  @@map("portfolios")
+}
+
+// ── Portfolio Balances ────────────────────────────────────────────────────────
+// One row per currency (INR, USD) per portfolio. UNIQUE constraint prevents
+// accidentally creating a second INR row for the same portfolio.
+
+model PortfolioBalance {
+  id           String   @id @default(uuid()) @db.Uuid
+  portfolioId  String   @map("portfolio_id") @db.Uuid
+  currency     String   // "INR" or "USD" — validated by Prisma at the application layer
+  cashBalance  Decimal  @map("cash_balance") @db.Decimal(18, 2)
+
+  portfolio    Portfolio @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+
+  @@unique([portfolioId, currency])
+  @@map("portfolio_balances")
+}
+
+// ── Orders ────────────────────────────────────────────────────────────────────
+// Polymorphic: a single table handles market, limit, stop-loss, and bracket orders.
+// parent_order_id links bracket children (target, stop-loss) to the entry order.
+// JSONB metadata stores bracket sibling IDs and other type-specific data.
+
+model Order {
+  id             String      @id @default(uuid()) @db.Uuid
+  userId         String      @map("user_id") @db.Uuid
+  parentOrderId  String?     @map("parent_order_id") @db.Uuid
+  side           OrderSide
+  orderType      OrderType   @map("order_type")
+  assetType      String      @map("asset_type") // "stock" or "crypto"
+  assetSymbol    String      @map("asset_symbol")
+  quantity       Decimal     @db.Decimal(18, 8)
+  price          Decimal?    @db.Decimal(18, 4)  // limit price for limit/bracket orders
+  stopPrice      Decimal?    @map("stop_price") @db.Decimal(18, 4)
+  status         OrderStatus
+  filledQuantity Decimal     @default(0) @map("filled_quantity") @db.Decimal(18, 8)
+  avgFillPrice   Decimal?    @map("avg_fill_price") @db.Decimal(18, 4)
+  metadata       Json        @default("{}") @db.JsonB
+  expiresAt      DateTime?   @map("expires_at") @db.Timestamptz
+  createdAt      DateTime    @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt      DateTime    @updatedAt @map("updated_at") @db.Timestamptz
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent Order? @relation("BracketOrders", fields: [parentOrderId], references: [id], onDelete: SetNull)
+  childOrders Order[] @relation("BracketOrders")
+
+  // TradeJournal entries referencing this order
+  tradeNotes TradeJournal[]
+
+  // Partial index: matching engine polls only pending/open orders by symbol
+  @@index([status, assetSymbol], name: "idx_orders_pending")
+  // Composite index for user's trade history sorted by recency
+  @@index([userId, createdAt(sort: Desc)], name: "idx_orders_user_date")
+  // Index for status-filtered queries: SELECT ... WHERE user_id = ? AND status = ?
+  // Without this, filtering by status requires a full scan of the user's orders
+  // before filtering. With it, PostgreSQL seeks directly to the relevant rows.
+  @@index([userId, status, createdAt(sort: Desc)], name: "idx_orders_user_status")
+  // Index for asset-filtered queries: SELECT ... WHERE user_id = ? AND asset_symbol = ?
+  // Many users filter by asset (e.g., "show me all my RELIANCE trades").
+  // This index makes that a narrow index seek instead of a sequential scan.
+  @@index([userId, assetSymbol, createdAt(sort: Desc)], name: "idx_orders_user_asset")
+  // Index for type-filtered queries: SELECT ... WHERE user_id = ? AND order_type = ?
+  @@index([userId, orderType, createdAt(sort: Desc)], name: "idx_orders_user_type")
+  // Partial index for bracket child lookups
+  @@index([parentOrderId], name: "idx_orders_parent")
+
+  @@map("orders")
+}
+
+// ── Positions ────────────────────────────────────────────────────────────────
+// Denormalized per (user, asset) for O(1) portfolio value reads.
+// Updated via UPSERT on every fill — no need to scan the orders table.
+
+model Position {
+  id           String     @id @default(uuid()) @db.Uuid
+  userId       String     @map("user_id") @db.Uuid
+  assetType    String     @map("asset_type")
+  assetSymbol  String     @map("asset_symbol")
+  quantity     Decimal    @default(0) @db.Decimal(18, 8)
+  avgBuyPrice  Decimal?   @map("avg_buy_price") @db.Decimal(18, 4)
+  currentPrice Decimal?   @map("current_price") @db.Decimal(18, 4)
+  createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime   @updatedAt @map("updated_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, assetType, assetSymbol])
+  @@map("positions")
+}
+
+// ── Watchlists ───────────────────────────────────────────────────────────────
+// Named lists — users maintain multiple watchlists (e.g. "Tech Stocks", "DeFi").
+
+model Watchlist {
+  id        String          @id @default(uuid()) @db.Uuid
+  userId    String          @map("user_id") @db.Uuid
+  name      String
+  createdAt DateTime        @default(now()) @map("created_at") @db.Timestamptz
+
+  user  User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items WatchlistItem[]
+
+  @@unique([userId, name])
+  @@map("watchlists")
+}
+
+// ── Watchlist Items ──────────────────────────────────────────────────────────
+// UNIQUE per (watchlist, asset) prevents the same symbol being added twice.
+
+model WatchlistItem {
+  id          String    @id @default(uuid()) @db.Uuid
+  watchlistId String    @map("watchlist_id") @db.Uuid
+  assetType   String    @map("asset_type")
+  assetSymbol String    @map("asset_symbol")
+  addedAt     DateTime  @default(now()) @map("added_at") @db.Timestamptz
+
+  watchlist Watchlist @relation(fields: [watchlistId], references: [id], onDelete: Cascade)
+
+  @@unique([watchlistId, assetSymbol])
+  @@index([watchlistId], name: "idx_watchlist_items_wl")
+  @@map("watchlist_items")
+}
+
+// ── Price Alerts ─────────────────────────────────────────────────────────────
+// direction: "above" or "below". The price-feed worker scans un-triggered alerts
+// via the partial index and marks triggered = true when the condition fires.
+
+model PriceAlert {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  assetType    String    @map("asset_type")
+  assetSymbol  String    @map("asset_symbol")
+  direction    String    // "above" | "below"
+  targetPrice  Decimal   @map("target_price") @db.Decimal(18, 4)
+  triggered    Boolean   @default(false)
+  triggeredAt  DateTime? @map("triggered_at") @db.Timestamptz
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Partial index: only non-triggered alerts matter when the price-feed worker scans
+  @@index([userId, assetSymbol, triggered], name: "idx_price_alerts_active")
+  @@map("price_alerts")
+}
+
+// ── Trade Journal ────────────────────────────────────────────────────────────
+// Free-form reflection notes with tags, linked to a closed order.
+
+model TradeJournal {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  orderId     String?   @map("order_id") @db.Uuid
+  assetType   String    @map("asset_type")
+  assetSymbol String    @map("asset_symbol")
+  notes       String?
+  tags        String[]
+  exitDate    DateTime? @map("exit_date") @db.Timestamptz
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order Order? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt(sort: Desc)], name: "idx_trade_journal_user")
+  @@map("trade_journal")
+}
