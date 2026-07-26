@@ -1,0 +1,51 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Models required for discovering active symbols (shared with backend)
+model WatchlistItem {
+  id          String   @id @default(uuid()) @db.Uuid
+  watchlistId String   @map("watchlist_id") @db.Uuid
+  assetType   String   @map("asset_type")
+  assetSymbol String   @map("asset_symbol")
+  addedAt     DateTime @default(now()) @map("added_at") @db.Timestamptz
+
+  @@index([watchlistId], name: "idx_watchlist_items_wl")
+  @@unique([watchlistId, assetSymbol])
+  @@map("watchlist_items")
+}
+
+model Position {
+  id           String   @id @default(uuid()) @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  assetType    String   @map("asset_type")
+  assetSymbol  String   @map("asset_symbol")
+  quantity     Decimal  @default(0) @db.Decimal(18, 8)
+  avgBuyPrice  Decimal? @map("avg_buy_price") @db.Decimal(18, 4)
+  currentPrice Decimal? @map("current_price") @db.Decimal(18, 4)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz
+
+  @@unique([userId, assetType, assetSymbol])
+  @@map("positions")
+}
+
+model PriceAlert {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  assetType    String    @map("asset_type")
+  assetSymbol  String    @map("asset_symbol")
+  direction    String
+  targetPrice  Decimal   @map("target_price") @db.Decimal(18, 4)
+  triggered    Boolean   @default(false)
+  triggeredAt  DateTime? @map("triggered_at") @db.Timestamptz
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz
+
+  @@index([userId, assetSymbol, triggered], name: "idx_price_alerts_active")
+  @@map("price_alerts")
+}
